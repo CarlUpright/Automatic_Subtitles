@@ -1,0 +1,15 @@
+# Dossiers binaires (trop gros pour GitHub)
+bin/
+
+# Fichiers temporaires
+*.tmp
+temp/
+output/
+
+# Fichiers de test
+*.mp3
+*.m4a
+*.wav
+*.mp4
+*.mkv
+*.srt
