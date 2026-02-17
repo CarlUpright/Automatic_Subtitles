@@ -6,6 +6,9 @@ bin/
 temp/
 output/
 
+# Archives (hébergées ailleurs)
+*.zip
+
 # Fichiers de test
 *.mp3
 *.m4a
