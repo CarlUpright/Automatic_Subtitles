@@ -4,6 +4,7 @@ bin/
 # Fichiers temporaires
 *.tmp
 temp/
+TEMP/
 output/
 
 # Archives (hébergées ailleurs)

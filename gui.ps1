@@ -576,7 +576,7 @@ $btnStart.Add_Click({
             Write-Log "  [1/3] Extraction audio..."
             Set-Status "[$(($i+1))/$total] Extraction audio..."
             & $ffmpeg -y -i $filepath -ar 16000 -ac 1 -c:a pcm_s16le $wav -hide_banner -loglevel error 2>$null
-            if (-not (Test-Path $wav)) { Write-Log "  [ERREUR] Extraction echouee"; $errors++; continue }
+            if (-not (Test-Path -LiteralPath $wav)) { Write-Log "  [ERREUR] Extraction echouee"; $errors++; continue }
 
             # Whisper - transcription
             Write-Log "  [2/3] Transcription..."
@@ -625,7 +625,7 @@ $btnStart.Add_Click({
             }
 
             Remove-Item $wav -Force -EA SilentlyContinue
-            if (-not (Test-Path $srt)) { Write-Log "  [ERREUR] SRT non cree"; $errors++; continue }
+            if (-not (Test-Path -LiteralPath $srt)) { Write-Log "  [ERREUR] SRT non cree"; $errors++; continue }
             Write-Log "  [OK] Sous-titres generes"
 
             # Review
@@ -702,7 +702,7 @@ $btnStart.Add_Click({
 
             Write-Log "  --- FIN ENCODAGE ---"
 
-            if (Test-Path $out) {
+            if (Test-Path -LiteralPath $out) {
                 $fileSize = [math]::Round((Get-Item $out).Length / 1MB, 2)
                 Write-Log "  [OK] $([IO.Path]::GetFileName($out)) ($fileSize Mo)"
                 $keep = $chkKeepSrt.Dispatcher.Invoke([Func[bool]]{ $chkKeepSrt.IsChecked })

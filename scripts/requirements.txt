@@ -1,0 +1,15 @@
+# Dépendances Python pour Video Translator
+# Installation: pip install -r requirements.txt
+
+# Séparation vocale
+demucs>=4.0.0
+
+# Text-to-Speech (Microsoft Edge - haute qualité)
+edge-tts>=6.1.0
+
+# Parsing des fichiers SRT
+pysrt>=1.1.2
+
+# Manipulation audio
+scipy>=1.11.0
+numpy>=1.24.0
