@@ -47,16 +47,16 @@ PYTHON      = SCRIPT_DIR / "bin" / "python" / "python.exe"
 # ─── TTS voice map ────────────────────────────────────────────────────────────
 
 VOICES = {
-    "fr-CA": {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-JeanNeural"},
-    "fr-FR": {"female": "fr-FR-DeniseNeural",     "male": "fr-FR-HenriNeural"},
-    "fr":    {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-JeanNeural"},
-    "en-US": {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural"},
-    "en-GB": {"female": "en-GB-SoniaNeural",      "male": "en-GB-RyanNeural"},
-    "en":    {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural"},
-    "es":    {"female": "es-ES-ElviraNeural",     "male": "es-ES-AlvaroNeural"},
-    "de":    {"female": "de-DE-KatjaNeural",      "male": "de-DE-ConradNeural"},
-    "it":    {"female": "it-IT-ElsaNeural",       "male": "it-IT-DiegoNeural"},
-    "pt":    {"female": "pt-BR-FranciscaNeural",  "male": "pt-BR-AntonioNeural"},
+    "fr-CA": {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-ThierryNeural",  "narrator": "fr-CA-AntoineNeural"},
+    "fr-FR": {"female": "fr-FR-DeniseNeural",     "male": "fr-FR-HenriNeural",    "narrator": "fr-FR-YvesNeural"},
+    "fr":    {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-ThierryNeural",  "narrator": "fr-CA-AntoineNeural"},
+    "en-US": {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural",      "narrator": "en-US-ChristopherNeural"},
+    "en-GB": {"female": "en-GB-SoniaNeural",      "male": "en-GB-RyanNeural",     "narrator": "en-GB-EthanNeural"},
+    "en":    {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural",      "narrator": "en-US-ChristopherNeural"},
+    "es":    {"female": "es-ES-ElviraNeural",     "male": "es-ES-AlvaroNeural",   "narrator": "es-ES-EstrellaNeural"},
+    "de":    {"female": "de-DE-KatjaNeural",      "male": "de-DE-ConradNeural",   "narrator": "de-DE-KillianNeural"},
+    "it":    {"female": "it-IT-ElsaNeural",       "male": "it-IT-DiegoNeural",    "narrator": "it-IT-IsabellaNeural"},
+    "pt":    {"female": "pt-BR-FranciscaNeural",  "male": "pt-BR-AntonioNeural",  "narrator": "pt-BR-ThalitaNeural"},
 }
 
 
@@ -66,10 +66,12 @@ VOICES = {
 # [WOMAN] / [FEMME] → force female voice for that line
 # Any other [bracketed content] is stripped and NOT voiced
 VOICE_DIRECTIVES = {
-    "[man]":    "male",
-    "[homme]":  "male",
-    "[woman]":  "female",
-    "[femme]":  "female",
+    "[man]":       "male",
+    "[homme]":     "male",
+    "[woman]":     "female",
+    "[femme]":     "female",
+    "[narrator]":  "narrator",
+    "[narrateur]": "narrator",
 }
 
 
@@ -86,8 +88,9 @@ def parse_subtitle(text: str, voice_map: dict) -> tuple:
     Returns (clean_text, voice) or (None, None) to skip this subtitle.
 
     Rules:
-    - [MAN] / [HOMME]  → use male voice, strip the tag
-    - [WOMAN] / [FEMME] → use female voice, strip the tag
+    - [MAN] / [HOMME]           → use male voice, strip the tag
+    - [WOMAN] / [FEMME]         → use female voice, strip the tag
+    - [NARRATOR] / [NARRATEUR]  → use narrator voice, strip the tag
     - Any other [bracketed content] → stripped silently
     - If nothing is left after stripping, return (None, None)
     """
@@ -279,18 +282,18 @@ def parse_srt(path: Path) -> list:
     except UnicodeDecodeError:
         text = path.read_text(encoding="latin-1")
     pattern = re.compile(
-        r"(\d+)\s*\r?\n"
+        r"(?:\d+\s*\r?\n)?"
         r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\r?\n"
         r"([\s\S]*?)(?=\r?\n\s*\r?\n|\Z)"
     )
     subs = []
-    for m in pattern.finditer(text):
-        raw = m.group(4).strip().replace("\r\n", " ").replace("\n", " ")
+    for i, m in enumerate(pattern.finditer(text), 1):
+        raw = m.group(3).strip().replace("\r\n", " ").replace("\n", " ")
         if raw:
             subs.append({
-                "index":    int(m.group(1)),
-                "start_ms": srt_time_to_ms(m.group(2)),
-                "end_ms":   srt_time_to_ms(m.group(3)),
+                "index":    i,
+                "start_ms": srt_time_to_ms(m.group(1)),
+                "end_ms":   srt_time_to_ms(m.group(2)),
                 "text":     raw,
             })
     return subs
@@ -420,6 +423,14 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
 
     clips_dir = work / "step4_tts_clips"
     clips_dir.mkdir(exist_ok=True)
+
+    # Remove stale clips from any previous run so deleted/merged subtitles
+    # don't linger and get picked up by step 5.
+    stale = list(clips_dir.glob("clip_*.mp3")) + list(clips_dir.glob("clip_*.wav"))
+    if stale:
+        print(f"  Removing {len(stale)} stale clip(s) from previous run...")
+        for f in stale:
+            f.unlink()
 
     # ── Plan all clips (filter + resolve per-line voice) ──────────────────
     plans   = []
@@ -770,14 +781,17 @@ def prompt_tts_options() -> tuple:
                     [l for l, _ in tts_langs], default=0)
     lang_tts = tts_langs[idx][1]
 
-    genders = [("Female", "female"), ("Male", "male")]
-    idx     = pick("Default voice gender:", [l for l, _ in genders], default=0)
+    genders = [("Female", "female"), ("Male", "male"), ("Narrator", "narrator")]
+    idx     = pick("Default voice (untagged lines):", [l for l, _ in genders], default=2)
     gender  = genders[idx][1]
 
     lang_key = lang_tts if lang_tts in VOICES else lang_tts.split("-")[0]
-    voice    = VOICES[lang_key][gender]
-    print(f"\n  Default voice: {voice}")
-    print("  (You can override per-line in the SRT with [HOMME]/[FEMME] or [MAN]/[WOMAN])")
+    voice_map = VOICES[lang_key]
+    print(f"\n  Voices for {lang_tts}:")
+    print(f"    Default  ({gender:8s}) : {voice_map[gender]}")
+    print(f"    [FEMME]  / [WOMAN]    : {voice_map['female']}")
+    print(f"    [HOMME]  / [MAN]      : {voice_map['male']}")
+    print(f"    [NARRATEUR]/[NARRATOR]: {voice_map['narrator']}")
 
     return lang_tts, gender
 
