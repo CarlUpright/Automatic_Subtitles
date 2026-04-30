@@ -331,6 +331,65 @@ def step1_extract(video: Path, work: Path):
     save_work_meta(work, {"video": str(video)})
 
 
+def _download_whisper_model(model: str, dest: Path):
+    import urllib.request
+    url = f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{model}.bin"
+    print(f"\n  Downloading ggml-{model}.bin...")
+    print(f"  From : {url}")
+    print(f"  To   : {dest}")
+
+    def _progress(block_num, block_size, total_size):
+        done = block_num * block_size
+        if total_size > 0:
+            pct  = min(100, done * 100 // total_size)
+            done_mb  = done / 1_048_576
+            total_mb = total_size / 1_048_576
+            print(f"\r  {pct:3d}%  {done_mb:.1f} / {total_mb:.1f} MB  ", end="", flush=True)
+
+    try:
+        urllib.request.urlretrieve(url, str(dest), reporthook=_progress)
+        print(f"\n  OK  ggml-{model}.bin  ({dest.stat().st_size // 1_048_576} MB)")
+    except Exception as e:
+        if dest.exists():
+            dest.unlink()
+        raise RuntimeError(
+            f"Download failed: {e}\n  Manual URL: {url}"
+        )
+
+
+def ensure_whisper_model(model: str) -> str:
+    """Return the model name to use. If missing, offer to download or switch to an installed one."""
+    model_file = WHISPER_DIR / f"ggml-{model}.bin"
+    if model_file.exists():
+        return model
+
+    available = sorted(
+        f.stem.replace("ggml-", "") for f in WHISPER_DIR.glob("ggml-*.bin")
+    )
+
+    print(f"\n  Model '{model}' is not installed.")
+    if available:
+        print(f"  Installed models: {', '.join(available)}")
+    else:
+        print("  No models are currently installed.")
+
+    options = [f"Download '{model}' now (requires internet)"]
+    options += [f"Use '{m}' instead" for m in available]
+    options.append("Cancel")
+
+    idx = pick("What do you want to do?", options, default=0)
+
+    if idx == 0:
+        _download_whisper_model(model, model_file)
+        return model
+    elif idx < len(options) - 1:
+        chosen = available[idx - 1]
+        print(f"  Using '{chosen}' instead.")
+        return chosen
+    else:
+        raise RuntimeError("No Whisper model available. Transcription cancelled.")
+
+
 def step2_transcribe(work: Path, model: str, lang_src: str):
     print("\n[STEP 2/7] Transcribing with Whisper...")
     wav      = work / "step1_audio_16k.wav"
@@ -341,10 +400,8 @@ def step2_transcribe(work: Path, model: str, lang_src: str):
     if not WHISPER.exists():
         raise FileNotFoundError(f"Whisper binary not found: {WHISPER}")
 
+    model = ensure_whisper_model(model)
     model_file = WHISPER_DIR / f"ggml-{model}.bin"
-    if not model_file.exists():
-        available = [f.name for f in WHISPER_DIR.glob("ggml-*.bin")]
-        raise FileNotFoundError(f"Model not found: {model_file}\nAvailable: {available}")
 
     cmd = [WHISPER, "-m", model_file, "-osrt", "-of", prefix, "-f", wav]
     if lang_src and lang_src != "auto":
@@ -765,8 +822,8 @@ def interactive_overlap_check(clips_dir: Path):
             break
 
 
-def prompt_tts_options() -> tuple:
-    """Ask TTS language and gender. Called right before step 4."""
+def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
+    """Ask TTS language and gender, with optional saved defaults."""
     tts_langs = [
         ("French Canada  — fr-CA", "fr-CA"),
         ("French France  — fr-FR", "fr-FR"),
@@ -777,12 +834,16 @@ def prompt_tts_options() -> tuple:
         ("Italian        — it",    "it"),
         ("Portuguese     — pt",    "pt"),
     ]
+    lang_codes   = [c for _, c in tts_langs]
+    def_lang_idx = lang_codes.index(default_lang) if default_lang in lang_codes else 0
     idx      = pick("TTS language (dubbed voice):",
-                    [l for l, _ in tts_langs], default=0)
+                    [l for l, _ in tts_langs], default=def_lang_idx)
     lang_tts = tts_langs[idx][1]
 
     genders = [("Female", "female"), ("Male", "male"), ("Narrator", "narrator")]
-    idx     = pick("Default voice (untagged lines):", [l for l, _ in genders], default=2)
+    gender_codes   = [c for _, c in genders]
+    def_gender_idx = gender_codes.index(default_gender) if default_gender in gender_codes else 2
+    idx     = pick("Default voice (untagged lines):", [l for l, _ in genders], default=def_gender_idx)
     gender  = genders[idx][1]
 
     lang_key = lang_tts if lang_tts in VOICES else lang_tts.split("-")[0]
@@ -796,15 +857,12 @@ def prompt_tts_options() -> tuple:
     return lang_tts, gender
 
 
-def prompt_volumes(work: Path) -> tuple:
-    """Ask background and TTS volumes. Called right before step 6."""
-    meta        = load_work_meta(work)
-    bg_default  = meta.get("bg_vol",  0.7)
-    tts_default = meta.get("tts_vol", 1.3)
+def prompt_volumes(bg_default: float = 0.7, tts_default: float = 1.3) -> tuple:
+    """Ask background and TTS volumes."""
     print("\n  Audio volumes — press Enter to keep the value shown in brackets:")
-    raw    = input(f"    Background volume [{bg_default}]: ").strip()
-    bg_vol = float(raw) if raw else bg_default
-    raw    = input(f"    TTS voice volume  [{tts_default}]: ").strip()
+    raw     = input(f"    Background volume [{bg_default}]: ").strip()
+    bg_vol  = float(raw) if raw else bg_default
+    raw     = input(f"    TTS voice volume  [{tts_default}]: ").strip()
     tts_vol = float(raw) if raw else tts_default
     return bg_vol, tts_vol
 
@@ -871,7 +929,42 @@ def interactive_mode():
         meta     = load_work_meta(work)
         video    = Path(meta["video"]) if "video" in meta else None
         lang_src = meta.get("lang_src", "auto")
-        model    = meta.get("model", "base")
+        model    = meta.get("model",    "base")
+
+        if start_step == 1 and video is None:
+            video = ask_path("Original video file (drag-and-drop or type path):")
+            if not video.exists():
+                print(f"\n  ERROR: File not found: {video}")
+                return
+
+        if start_step <= 2 <= end_step:
+            src_langs = [
+                ("Auto-detect",  "auto"),
+                ("French",       "fr"),
+                ("English",      "en"),
+                ("Spanish",      "es"),
+                ("German",       "de"),
+                ("Italian",      "it"),
+                ("Portuguese",   "pt"),
+            ]
+            lang_codes   = [c for _, c in src_langs]
+            def_lang_idx = lang_codes.index(lang_src) if lang_src in lang_codes else 0
+            idx      = pick("Source language (audio in the video):",
+                            [l for l, _ in src_langs], default=def_lang_idx)
+            lang_src = src_langs[idx][1]
+
+            models = [
+                ("tiny      — fastest, less accurate",       "tiny"),
+                ("base      — good balance  (recommended)",  "base"),
+                ("small     — better accuracy",              "small"),
+                ("medium    — very accurate, slower",        "medium"),
+                ("large-v3  — best accuracy, slow",          "large-v3"),
+            ]
+            model_codes   = [c for _, c in models]
+            def_model_idx = model_codes.index(model) if model in model_codes else 1
+            idx   = pick("Whisper model:", [l for l, _ in models], default=def_model_idx)
+            model = models[idx][1]
+            save_work_meta(work, {"lang_src": lang_src, "model": model})
 
     # ── NEW SESSION ───────────────────────────────────────────────────────
     else:
@@ -907,55 +1000,64 @@ def interactive_mode():
 
         start_step = 1
         end_step   = 7
+        meta       = {}
 
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         work = SCRIPT_DIR / "TEMP" / f"translate_{ts}"
         work.mkdir(parents=True, exist_ok=True)
         save_work_meta(work, {"video": str(video), "lang_src": lang_src, "model": model})
 
+    # ── Settings for remaining steps — all asked upfront ──────────────────
+    lang_tts = bg_vol = tts_vol = gender = None
+
+    if start_step <= 4 <= end_step:
+        print(f"\n{'─'*60}")
+        print("  TTS voice settings (step 4):")
+        lang_tts, gender = prompt_tts_options(
+            default_lang=meta.get("lang_tts"),
+            default_gender=meta.get("gender"),
+        )
+        save_work_meta(work, {"lang_tts": lang_tts, "gender": gender})
+        print(f"{'─'*60}")
+
+    if start_step <= 6 <= end_step:
+        print(f"\n{'─'*60}")
+        print("  Audio volumes (step 6):")
+        bg_vol, tts_vol = prompt_volumes(
+            bg_default=meta.get("bg_vol",   0.7),
+            tts_default=meta.get("tts_vol", 1.3),
+        )
+        save_work_meta(work, {"bg_vol": bg_vol, "tts_vol": tts_vol})
+        print(f"{'─'*60}")
+
     # ── Summary & confirm ─────────────────────────────────────────────────
     print()
     print("=" * 60)
-    if mode_choice == 0:
+    if video:
         print(f"  Video    : {video}")
     print(f"  Work dir : {work}")
     print(f"  Steps    : {start_step} → {end_step}")
-    if mode_choice == 0:
+    if start_step <= 2 <= end_step:
         print(f"  Model    : {model}  |  lang-src: {lang_src}")
-    if start_step <= 4 <= end_step:
-        print("  Voice    : will be asked before step 4")
-    if start_step <= 6 <= end_step:
-        print("  Volumes  : will be asked before step 6")
+    if lang_tts:
+        print(f"  Voice    : {lang_tts} / {gender}")
+    if bg_vol is not None:
+        print(f"  Volumes  : bg={bg_vol}  tts={tts_vol}")
     print("=" * 60)
     go = input("\n  Start? [Y/n]: ").strip().lower()
     if go in ("n", "no"):
         print("  Cancelled.")
         return
 
-    # ── Run steps, prompting for settings right before they are needed ────
+    # ── Run steps ─────────────────────────────────────────────────────────
     print()
-    lang_tts = bg_vol = tts_vol = gender = None   # resolved just-in-time below
 
     for step in range(start_step, end_step + 1):
-
-        if step == 4:
-            print(f"\n{'─'*60}")
-            print("  Step 4 needs a voice — choose now:")
-            lang_tts, gender = prompt_tts_options()
-            save_work_meta(work, {"lang_tts": lang_tts, "gender": gender})
-            print(f"{'─'*60}")
 
         if step == 5:
             print(f"\n{'─'*60}")
             print("  Checking for overlapping clips before merge...")
             interactive_overlap_check(work / "step4_tts_clips")
-            print(f"{'─'*60}")
-
-        if step == 6:
-            print(f"\n{'─'*60}")
-            print("  Step 6 needs audio volumes — choose now:")
-            bg_vol, tts_vol = prompt_volumes(work)
-            save_work_meta(work, {"bg_vol": bg_vol, "tts_vol": tts_vol})
             print(f"{'─'*60}")
 
         if   step == 1: step1_extract(video, work)
