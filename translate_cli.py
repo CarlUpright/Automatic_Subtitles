@@ -15,7 +15,7 @@ Pipeline:
   6  Mix audio      (FFmpeg: background + TTS → step6_mixed.wav)
   7  Assemble       (FFmpeg: video + mixed audio → output/<name>_translated.mp4)
 
-All intermediate files are kept in the work directory (TEMP/translate_YYYYMMDD_HHMMSS/).
+All intermediate files are kept in the work directory (TEMP/<videoname>_YYYYMMDD_HHMMSS/).
 
 Debug usage (no interactive prompts):
   python translate_cli.py video.mp4 --lang-tts fr-CA --gender female
@@ -50,6 +50,7 @@ VOICES = {
     "fr-CA": {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-ThierryNeural",  "narrator": "fr-CA-AntoineNeural"},
     "fr-FR": {"female": "fr-FR-DeniseNeural",     "male": "fr-FR-HenriNeural",    "narrator": "fr-FR-YvesNeural"},
     "fr":    {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-ThierryNeural",  "narrator": "fr-CA-AntoineNeural"},
+    "en-CA": {"female": "en-CA-ClaraNeural",      "male": "en-CA-LiamNeural",     "narrator": "en-CA-LiamNeural"},
     "en-US": {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural",      "narrator": "en-US-ChristopherNeural"},
     "en-GB": {"female": "en-GB-SoniaNeural",      "male": "en-GB-RyanNeural",     "narrator": "en-GB-EthanNeural"},
     "en":    {"female": "en-US-JennyNeural",      "male": "en-US-GuyNeural",      "narrator": "en-US-ChristopherNeural"},
@@ -257,6 +258,13 @@ def propose_resolution(cluster_indices: list, all_clips: list):
 
 
 # ─── Pipeline helpers ─────────────────────────────────────────────────────────
+
+def sanitize_name(name: str) -> str:
+    """Strip/replace characters that are unsafe in directory names."""
+    name = re.sub(r'[^\w-]', '_', name)   # keep letters, digits, _, -
+    name = re.sub(r'_+', '_', name)        # collapse runs of underscores
+    return name.strip('_') or 'video'
+
 
 def run(cmd: list, label: str = "") -> subprocess.CompletedProcess:
     tag = label or Path(str(cmd[0])).name
@@ -642,7 +650,7 @@ def step5_merge_tts(work: Path):
     print(f"  OK  {out_wav.name}  ({out_wav.stat().st_size // (1024*1024)} MB)")
 
 
-def step6_mix(work: Path, bg_vol: float = 0.7, tts_vol: float = 1.3):
+def step6_mix(work: Path, bg_vol: float = 0.7, tts_vol: float = 1.3, orig_vol: float = 0.0):
     print("\n[STEP 6/7] Mixing background + TTS...")
     bg    = work / "step3_background.wav"
     tts   = work / "step5_tts_merged.wav"
@@ -655,16 +663,40 @@ def step6_mix(work: Path, bg_vol: float = 0.7, tts_vol: float = 1.3):
     print(f"  Background : {bg.name}   vol={bg_vol}")
     print(f"  TTS        : {tts.name}  vol={tts_vol}")
 
-    # normalize=0 keeps full amplitude — no per-input division
-    run([FFMPEG, "-y",
-         "-i", bg, "-i", tts,
-         "-filter_complex",
-         f"[0:a]volume={bg_vol}[bg];[1:a]volume={tts_vol}[tts];"
-         "[bg][tts]amix=inputs=2:duration=first:normalize=0[out]",
-         "-map", "[out]",
-         "-c:a", "pcm_s16le",
-         mixed],
-        label="ffmpeg mix")
+    if orig_vol > 0:
+        vocals_path = work / "step3_demucs" / "htdemucs" / "step1_audio_44k" / "vocals.wav"
+        if not vocals_path.exists():
+            found = list((work / "step3_demucs").rglob("vocals.wav"))
+            if not found:
+                raise FileNotFoundError(
+                    "Original vocals track not found — run step 3 (Demucs) first, "
+                    "or set original audio volume to 0."
+                )
+            vocals_path = found[0]
+        print(f"  Original   : {vocals_path.name}  vol={orig_vol}")
+
+        # normalize=0 keeps full amplitude — no per-input division
+        run([FFMPEG, "-y",
+             "-i", bg, "-i", tts, "-i", vocals_path,
+             "-filter_complex",
+             f"[0:a]volume={bg_vol}[bg];[1:a]volume={tts_vol}[tts];[2:a]volume={orig_vol}[orig];"
+             "[bg][tts][orig]amix=inputs=3:duration=first:normalize=0[out]",
+             "-map", "[out]",
+             "-c:a", "pcm_s16le",
+             mixed],
+            label="ffmpeg mix")
+    else:
+        # normalize=0 keeps full amplitude — no per-input division
+        run([FFMPEG, "-y",
+             "-i", bg, "-i", tts,
+             "-filter_complex",
+             f"[0:a]volume={bg_vol}[bg];[1:a]volume={tts_vol}[tts];"
+             "[bg][tts]amix=inputs=2:duration=first:normalize=0[out]",
+             "-map", "[out]",
+             "-c:a", "pcm_s16le",
+             mixed],
+            label="ffmpeg mix")
+
     print(f"  OK  {mixed.name}  ({mixed.stat().st_size // (1024*1024)} MB)")
 
 
@@ -689,14 +721,14 @@ def step7_assemble(video: Path, work: Path, output_dir: Path) -> Path:
 
 
 def run_steps(video, work, start_step, end_step, output_dir,
-              model, lang_src, lang_tts, gender, bg_vol, tts_vol):
+              model, lang_src, lang_tts, gender, bg_vol, tts_vol, orig_vol=0.0):
     for step in range(start_step, end_step + 1):
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
         elif step == 3: step3_separate(work)
         elif step == 4: step4_tts(work, lang_tts, gender)
         elif step == 5: step5_merge_tts(work)
-        elif step == 6: step6_mix(work, bg_vol, tts_vol)
+        elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol)
         elif step == 7:
             if video is None:
                 meta = load_work_meta(work)
@@ -827,6 +859,7 @@ def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
     tts_langs = [
         ("French Canada  — fr-CA", "fr-CA"),
         ("French France  — fr-FR", "fr-FR"),
+        ("English Canada — en-CA", "en-CA"),
         ("English US     — en-US", "en-US"),
         ("English UK     — en-GB", "en-GB"),
         ("Spanish        — es",    "es"),
@@ -857,14 +890,17 @@ def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
     return lang_tts, gender
 
 
-def prompt_volumes(bg_default: float = 0.7, tts_default: float = 1.3) -> tuple:
-    """Ask background and TTS volumes."""
+def prompt_volumes(bg_default: float = 0.7, tts_default: float = 1.3, orig_default: float = 0.0) -> tuple:
+    """Ask background, TTS, and original audio volumes."""
     print("\n  Audio volumes — press Enter to keep the value shown in brackets:")
-    raw     = input(f"    Background volume [{bg_default}]: ").strip()
-    bg_vol  = float(raw) if raw else bg_default
-    raw     = input(f"    TTS voice volume  [{tts_default}]: ").strip()
-    tts_vol = float(raw) if raw else tts_default
-    return bg_vol, tts_vol
+    raw      = input(f"    Background volume [{bg_default}]: ").strip()
+    bg_vol   = float(raw) if raw else bg_default
+    raw      = input(f"    TTS voice volume  [{tts_default}]: ").strip()
+    tts_vol  = float(raw) if raw else tts_default
+    raw      = input(f"    Original audio    [{orig_default}]"
+                     f"  (0 = off, e.g. 0.3 to keep original voice in background): ").strip()
+    orig_vol = float(raw) if raw else orig_default
+    return bg_vol, tts_vol, orig_vol
 
 
 def interactive_mode():
@@ -894,7 +930,10 @@ def interactive_mode():
     # ── RESUME ────────────────────────────────────────────────────────────
     if mode_choice == 1:
         temp_base = SCRIPT_DIR / "TEMP"
-        sessions  = sorted(temp_base.glob("translate_*"), reverse=True)[:15] if temp_base.exists() else []
+        sessions  = sorted(
+            [d for d in temp_base.iterdir() if d.is_dir()],
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )[:15] if temp_base.exists() else []
 
         if sessions:
             labels = [s.name for s in sessions] + ["Type the path manually"]
@@ -1003,12 +1042,12 @@ def interactive_mode():
         meta       = {}
 
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        work = SCRIPT_DIR / "TEMP" / f"translate_{ts}"
+        work = SCRIPT_DIR / "TEMP" / f"{sanitize_name(video.stem)}_{ts}"
         work.mkdir(parents=True, exist_ok=True)
         save_work_meta(work, {"video": str(video), "lang_src": lang_src, "model": model})
 
     # ── Settings for remaining steps — all asked upfront ──────────────────
-    lang_tts = bg_vol = tts_vol = gender = None
+    lang_tts = bg_vol = tts_vol = orig_vol = gender = None
 
     if start_step <= 4 <= end_step:
         print(f"\n{'─'*60}")
@@ -1023,11 +1062,12 @@ def interactive_mode():
     if start_step <= 6 <= end_step:
         print(f"\n{'─'*60}")
         print("  Audio volumes (step 6):")
-        bg_vol, tts_vol = prompt_volumes(
-            bg_default=meta.get("bg_vol",   0.7),
-            tts_default=meta.get("tts_vol", 1.3),
+        bg_vol, tts_vol, orig_vol = prompt_volumes(
+            bg_default=meta.get("bg_vol",    0.7),
+            tts_default=meta.get("tts_vol",  1.3),
+            orig_default=meta.get("orig_vol", 0.0),
         )
-        save_work_meta(work, {"bg_vol": bg_vol, "tts_vol": tts_vol})
+        save_work_meta(work, {"bg_vol": bg_vol, "tts_vol": tts_vol, "orig_vol": orig_vol})
         print(f"{'─'*60}")
 
     # ── Summary & confirm ─────────────────────────────────────────────────
@@ -1042,7 +1082,8 @@ def interactive_mode():
     if lang_tts:
         print(f"  Voice    : {lang_tts} / {gender}")
     if bg_vol is not None:
-        print(f"  Volumes  : bg={bg_vol}  tts={tts_vol}")
+        orig_str = f"  orig={orig_vol}" if orig_vol else ""
+        print(f"  Volumes  : bg={bg_vol}  tts={tts_vol}{orig_str}")
     print("=" * 60)
     go = input("\n  Start? [Y/n]: ").strip().lower()
     if go in ("n", "no"):
@@ -1065,7 +1106,7 @@ def interactive_mode():
         elif step == 3: step3_separate(work)
         elif step == 4: step4_tts(work, lang_tts, gender)
         elif step == 5: step5_merge_tts(work)
-        elif step == 6: step6_mix(work, bg_vol, tts_vol)
+        elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol or 0.0)
         elif step == 7:
             if video is None:
                 meta = load_work_meta(work)
@@ -1101,6 +1142,7 @@ def cli_mode():
             "  python translate_cli.py --work-dir TEMP\\translate_xxx --from-step 4",
             "  python translate_cli.py video.mp4 --only-step 4 --work-dir TEMP\\translate_xxx",
             "  python translate_cli.py video.mp4 --only-step 6 --bg-vol 0.5 --tts-vol 1.8 --work-dir TEMP\\xxx",
+            "  python translate_cli.py video.mp4 --only-step 6 --bg-vol 0.5 --tts-vol 1.8 --orig-vol 0.3 --work-dir TEMP\\xxx",
         ]),
     )
     parser.add_argument("video",       nargs="?",   help="Input video file")
@@ -1113,6 +1155,8 @@ def cli_mode():
     parser.add_argument("--only-step", type=int,             help="Run only step N")
     parser.add_argument("--bg-vol",    type=float, default=0.7)
     parser.add_argument("--tts-vol",   type=float, default=1.3)
+    parser.add_argument("--orig-vol",  type=float, default=0.0,
+                        help="Volume for original vocals in background (default: 0 = off)")
     args = parser.parse_args()
 
     start_step = args.only_step or args.from_step
@@ -1131,7 +1175,8 @@ def cli_mode():
             parser.error(f"Work directory not found: {work}")
     else:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        work = SCRIPT_DIR / "TEMP" / f"translate_{ts}"
+        stem = sanitize_name(video.stem) if video else "video"
+        work = SCRIPT_DIR / "TEMP" / f"{stem}_{ts}"
         work.mkdir(parents=True, exist_ok=True)
 
     video = Path(args.video).resolve() if args.video else None
@@ -1147,7 +1192,8 @@ def cli_mode():
     print(f"  Work dir : {work}")
     print(f"  TTS      : {args.lang_tts} / {args.gender}")
     print(f"  Model    : {args.model}  |  lang-src: {args.lang_src}")
-    print(f"  Volumes  : bg={args.bg_vol}  tts={args.tts_vol}")
+    orig_str = f"  orig={args.orig_vol}" if args.orig_vol else ""
+    print(f"  Volumes  : bg={args.bg_vol}  tts={args.tts_vol}{orig_str}")
     print(f"  Steps    : {start_step} → {end_step}")
     print()
 
@@ -1158,6 +1204,7 @@ def cli_mode():
         model=args.model, lang_src=args.lang_src,
         lang_tts=args.lang_tts, gender=args.gender,
         bg_vol=args.bg_vol, tts_vol=args.tts_vol,
+        orig_vol=args.orig_vol,
     )
 
 
