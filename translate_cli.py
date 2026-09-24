@@ -36,6 +36,15 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
+# Windows picks the console's active codepage (often cp1252) for stdout/stderr
+# when they aren't a real console — e.g. piped through `| Tee-Object` or
+# redirected to a file — and that codepage can't encode the ─/→/← characters
+# used throughout this script's output, crashing with UnicodeEncodeError.
+# Force UTF-8 regardless of how stdout/stderr are attached.
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ─── Binary paths ─────────────────────────────────────────────────────────────
 
 SCRIPT_DIR  = Path(__file__).parent.resolve()
@@ -143,7 +152,7 @@ def scan_clips(clips_dir: Path) -> list:
     for wav in sorted(clips_dir.glob("clip_*.wav")):
         m = re.search(r'clip_(\d+h\d+m\d+s\d+)', wav.stem)
         if not m:
-            print(f"  WARN: skipping {wav.name} — cannot parse timecode from name")
+            print(f"  WARN: skipping {wav.name} - cannot parse timecode from name")
             continue
         start_ms = timecode_to_ms(m.group(1))
         try:
@@ -212,7 +221,7 @@ def propose_resolution(cluster_indices: list, all_clips: list):
         if can_push_B:
             return [(B["file"], new_path(B_new_start),
                      f"Push  {B['file'].name}  +{ms_to_human(ov)}\n"
-                     f"   →  clip_{ms_to_timecode(B_new_start)}.wav")]
+                     f"   ->  clip_{ms_to_timecode(B_new_start)}.wav")]
 
         # Option 2 — pull A earlier
         A_new_start = A["start_ms"] - ov
@@ -222,7 +231,7 @@ def propose_resolution(cluster_indices: list, all_clips: list):
         if can_pull_A:
             return [(A["file"], new_path(A_new_start),
                      f"Pull  {A['file'].name}  -{ms_to_human(ov)}\n"
-                     f"   →  clip_{ms_to_timecode(A_new_start)}.wav")]
+                     f"   ->  clip_{ms_to_timecode(A_new_start)}.wav")]
 
         return None
 
@@ -245,10 +254,10 @@ def propose_resolution(cluster_indices: list, all_clips: list):
             return [
                 (A["file"], new_path(A_new_start),
                  f"Pull  {A['file'].name}  -{ms_to_human(ov_AB)}\n"
-                 f"   →  clip_{ms_to_timecode(A_new_start)}.wav"),
+                 f"   ->  clip_{ms_to_timecode(A_new_start)}.wav"),
                 (C["file"], new_path(C_new_start),
                  f"Push  {C['file'].name}  +{ms_to_human(ov_BC)}\n"
-                 f"   →  clip_{ms_to_timecode(C_new_start)}.wav"),
+                 f"   ->  clip_{ms_to_timecode(C_new_start)}.wav"),
             ]
 
         return None
@@ -464,7 +473,7 @@ async def _generate_tts_clips(plans: list, clips_dir: Path):
         communicate = edge_tts.Communicate(plan["text"], plan["voice"])
         await communicate.save(str(mp3))
         size = mp3.stat().st_size // 1024 if mp3.exists() else 0
-        print(f"    → {mp3.name}  ({size} KB)")
+        print(f"    -> {mp3.name}  ({size} KB)")
 
 
 def step4_tts(work: Path, lang_tts: str, gender: str):
@@ -534,7 +543,7 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
     asyncio.run(_generate_tts_clips(plans, clips_dir))
 
     # ── Convert MP3 → WAV ─────────────────────────────────────────────────
-    print("\n  Converting MP3 → WAV (24kHz mono)...")
+    print("\n  Converting MP3 -> WAV (24kHz mono)...")
     metadata = []
     for plan in plans:
         mp3 = clips_dir / plan["mp3_name"]
@@ -561,7 +570,7 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
             "mp3":      str(mp3),
             "wav":      str(wav),
         })
-        print(f"    {wav.name}  ({plan['start_ms']/1000:.2f}s → {plan['end_ms']/1000:.2f}s)  [{plan['voice'].split('-')[2] if plan['voice'].count('-') >= 2 else plan['voice']}]")
+        print(f"    {wav.name}  ({plan['start_ms']/1000:.2f}s -> {plan['end_ms']/1000:.2f}s)  [{plan['voice'].split('-')[2] if plan['voice'].count('-') >= 2 else plan['voice']}]")
 
     if not metadata:
         raise RuntimeError("No TTS clips generated. Check edge-tts and internet connection.")
@@ -582,7 +591,7 @@ def step5_merge_tts(work: Path):
 
     clips_dir = work / "step4_tts_clips"
     if not clips_dir.exists():
-        raise FileNotFoundError(f"Clips directory not found: {clips_dir} — run step 4 first.")
+        raise FileNotFoundError(f"Clips directory not found: {clips_dir} - run step 4 first.")
 
     clips = scan_clips(clips_dir)
     if not clips:
@@ -632,7 +641,7 @@ def step5_merge_tts(work: Path):
             buf = np.vstack([buf, np.zeros((end_f - len(buf), n_channels), dtype=np.float32)])
 
         buf[start_f:end_f] += samples
-        print(f"  Placed {wav_path.name}: {clip['start_ms']/1000:.2f}s → {end_f/sample_rate:.2f}s")
+        print(f"  Placed {wav_path.name}: {clip['start_ms']/1000:.2f}s -> {end_f/sample_rate:.2f}s")
 
     peak = float(np.max(np.abs(buf)))
     if peak > 32767:
@@ -669,7 +678,7 @@ def step6_mix(work: Path, bg_vol: float = 0.7, tts_vol: float = 1.3, orig_vol: f
             found = list((work / "step3_demucs").rglob("vocals.wav"))
             if not found:
                 raise FileNotFoundError(
-                    "Original vocals track not found — run step 3 (Demucs) first, "
+                    "Original vocals track not found - run step 3 (Demucs) first, "
                     "or set original audio volume to 0."
                 )
             vocals_path = found[0]
@@ -755,7 +764,7 @@ def pick(prompt: str, options: list, default: int = 0) -> int:
     """Show a numbered menu, return 0-based index of chosen item."""
     print(f"\n{prompt}")
     for i, label in enumerate(options):
-        star = "  ← default" if i == default else ""
+        star = "  <- default" if i == default else ""
         print(f"    [{i+1}] {label}{star}")
     while True:
         raw = input(f"  Your choice [{default+1}]: ").strip()
@@ -788,7 +797,7 @@ def interactive_overlap_check(clips_dir: Path):
         clusters = find_clusters(clips)
 
         if not clusters:
-            print(f"  OK  No overlaps — {len(clips)} clips, all clear.")
+            print(f"  OK  No overlaps - {len(clips)} clips, all clear.")
             break
 
         n_conflicts = len(clusters)
@@ -801,16 +810,16 @@ def interactive_overlap_check(clips_dir: Path):
             cclips = [clips[idx] for idx in cluster_indices]
 
             # ── Display the cluster ──────────────────────────────────────
-            print(f"  {'─'*52}")
+            print(f"  {'-'*52}")
             print(f"  CONFLICT  {n} clips:")
             prev_end = None
             for pos, c in enumerate(cclips):
                 ov_str = ""
                 if prev_end is not None and prev_end > c["start_ms"]:
-                    ov_str = f"  ← {ms_to_human(prev_end - c['start_ms'])} overlap"
+                    ov_str = f"  <- {ms_to_human(prev_end - c['start_ms'])} overlap"
                 label = "ABCDE"[pos] if pos < 5 else str(pos)
                 print(f"    [{label}]  {c['file'].name}")
-                print(f"          {ms_to_human(c['start_ms'])} → {ms_to_human(c['end_ms'])}"
+                print(f"          {ms_to_human(c['start_ms'])} -> {ms_to_human(c['end_ms'])}"
                       f"  (dur {ms_to_human(c['dur_ms'])}){ov_str}")
                 prev_end = c["end_ms"]
 
@@ -827,12 +836,12 @@ def interactive_overlap_check(clips_dir: Path):
                 if choice == "a":
                     for old, new, _ in resolution:
                         old.rename(new)
-                        print(f"    {old.name}  →  {new.name}")
+                        print(f"    {old.name}  ->  {new.name}")
                     applied_any = True
                     break   # re-scan immediately after any rename
             else:
                 if n > 3:
-                    reason = f"{n} clips — only 2 and 3-clip conflicts can be auto-fixed"
+                    reason = f"{n} clips - only 2 and 3-clip conflicts can be auto-fixed"
                 else:
                     reason = "auto-fix would create a new conflict with a neighbouring clip"
                 print(f"\n  No automatic solution ({reason}).")
@@ -850,22 +859,22 @@ def interactive_overlap_check(clips_dir: Path):
         choice = input("  [R] Re-scan   [Enter] Continue anyway: ").strip().lower()
         if choice != "r":
             if clusters:
-                print("  Continuing with remaining overlaps — they will mix together.")
+                print("  Continuing with remaining overlaps - they will mix together.")
             break
 
 
 def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
     """Ask TTS language and gender, with optional saved defaults."""
     tts_langs = [
-        ("French Canada  — fr-CA", "fr-CA"),
-        ("French France  — fr-FR", "fr-FR"),
-        ("English Canada — en-CA", "en-CA"),
-        ("English US     — en-US", "en-US"),
-        ("English UK     — en-GB", "en-GB"),
-        ("Spanish        — es",    "es"),
-        ("German         — de",    "de"),
-        ("Italian        — it",    "it"),
-        ("Portuguese     — pt",    "pt"),
+        ("French Canada  - fr-CA", "fr-CA"),
+        ("French France  - fr-FR", "fr-FR"),
+        ("English Canada - en-CA", "en-CA"),
+        ("English US     - en-US", "en-US"),
+        ("English UK     - en-GB", "en-GB"),
+        ("Spanish        - es",    "es"),
+        ("German         - de",    "de"),
+        ("Italian        - it",    "it"),
+        ("Portuguese     - pt",    "pt"),
     ]
     lang_codes   = [c for _, c in tts_langs]
     def_lang_idx = lang_codes.index(default_lang) if default_lang in lang_codes else 0
@@ -892,7 +901,7 @@ def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
 
 def prompt_volumes(bg_default: float = 0.7, tts_default: float = 1.3, orig_default: float = 0.0) -> tuple:
     """Ask background, TTS, and original audio volumes."""
-    print("\n  Audio volumes — press Enter to keep the value shown in brackets:")
+    print("\n  Audio volumes - press Enter to keep the value shown in brackets:")
     raw      = input(f"    Background volume [{bg_default}]: ").strip()
     bg_vol   = float(raw) if raw else bg_default
     raw      = input(f"    TTS voice volume  [{tts_default}]: ").strip()
@@ -947,13 +956,13 @@ def interactive_mode():
             return
 
         step_labels = [
-            "1 — Extract audio",
-            "2 — Transcribe with Whisper",
-            "3 — Separate vocals (Demucs)",
-            "4 — Generate TTS clips",
-            "5 — Merge TTS clips",
-            "6 — Mix background + TTS",
-            "7 — Assemble final video",
+            "1 - Extract audio",
+            "2 - Transcribe with Whisper",
+            "3 - Separate vocals (Demucs)",
+            "4 - Generate TTS clips",
+            "5 - Merge TTS clips",
+            "6 - Mix background + TTS",
+            "7 - Assemble final video",
         ]
         from_idx   = pick("Start from which step?", step_labels, default=3)
         start_step = from_idx + 1
@@ -993,11 +1002,11 @@ def interactive_mode():
             lang_src = src_langs[idx][1]
 
             models = [
-                ("tiny      — fastest, less accurate",       "tiny"),
-                ("base      — good balance  (recommended)",  "base"),
-                ("small     — better accuracy",              "small"),
-                ("medium    — very accurate, slower",        "medium"),
-                ("large-v3  — best accuracy, slow",          "large-v3"),
+                ("tiny      - fastest, less accurate",       "tiny"),
+                ("base      - good balance  (recommended)",  "base"),
+                ("small     - better accuracy",              "small"),
+                ("medium    - very accurate, slower",        "medium"),
+                ("large-v3  - best accuracy, slow",          "large-v3"),
             ]
             model_codes   = [c for _, c in models]
             def_model_idx = model_codes.index(model) if model in model_codes else 1
@@ -1028,11 +1037,11 @@ def interactive_mode():
         lang_src = src_langs[idx][1]
 
         models = [
-            ("tiny      — fastest, less accurate",       "tiny"),
-            ("base      — good balance  (recommended)",  "base"),
-            ("small     — better accuracy",              "small"),
-            ("medium    — very accurate, slower",        "medium"),
-            ("large-v3  — best accuracy, slow",          "large-v3"),
+            ("tiny      - fastest, less accurate",       "tiny"),
+            ("base      - good balance  (recommended)",  "base"),
+            ("small     - better accuracy",              "small"),
+            ("medium    - very accurate, slower",        "medium"),
+            ("large-v3  - best accuracy, slow",          "large-v3"),
         ]
         idx   = pick("Whisper model:", [l for l, _ in models], default=1)
         model = models[idx][1]
@@ -1050,17 +1059,17 @@ def interactive_mode():
     lang_tts = bg_vol = tts_vol = orig_vol = gender = None
 
     if start_step <= 4 <= end_step:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print("  TTS voice settings (step 4):")
         lang_tts, gender = prompt_tts_options(
             default_lang=meta.get("lang_tts"),
             default_gender=meta.get("gender"),
         )
         save_work_meta(work, {"lang_tts": lang_tts, "gender": gender})
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
     if start_step <= 6 <= end_step:
-        print(f"\n{'─'*60}")
+        print(f"\n{'-'*60}")
         print("  Audio volumes (step 6):")
         bg_vol, tts_vol, orig_vol = prompt_volumes(
             bg_default=meta.get("bg_vol",    0.7),
@@ -1068,7 +1077,7 @@ def interactive_mode():
             orig_default=meta.get("orig_vol", 0.0),
         )
         save_work_meta(work, {"bg_vol": bg_vol, "tts_vol": tts_vol, "orig_vol": orig_vol})
-        print(f"{'─'*60}")
+        print(f"{'-'*60}")
 
     # ── Summary & confirm ─────────────────────────────────────────────────
     print()
@@ -1076,7 +1085,7 @@ def interactive_mode():
     if video:
         print(f"  Video    : {video}")
     print(f"  Work dir : {work}")
-    print(f"  Steps    : {start_step} → {end_step}")
+    print(f"  Steps    : {start_step} -> {end_step}")
     if start_step <= 2 <= end_step:
         print(f"  Model    : {model}  |  lang-src: {lang_src}")
     if lang_tts:
@@ -1096,10 +1105,10 @@ def interactive_mode():
     for step in range(start_step, end_step + 1):
 
         if step == 5:
-            print(f"\n{'─'*60}")
+            print(f"\n{'-'*60}")
             print("  Checking for overlapping clips before merge...")
             interactive_overlap_check(work / "step4_tts_clips")
-            print(f"{'─'*60}")
+            print(f"{'-'*60}")
 
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
@@ -1194,7 +1203,7 @@ def cli_mode():
     print(f"  Model    : {args.model}  |  lang-src: {args.lang_src}")
     orig_str = f"  orig={args.orig_vol}" if args.orig_vol else ""
     print(f"  Volumes  : bg={args.bg_vol}  tts={args.tts_vol}{orig_str}")
-    print(f"  Steps    : {start_step} → {end_step}")
+    print(f"  Steps    : {start_step} -> {end_step}")
     print()
 
     run_steps(
