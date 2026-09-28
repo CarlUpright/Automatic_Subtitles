@@ -49,6 +49,7 @@ if sys.platform == "win32":
 
 SCRIPT_DIR  = Path(__file__).parent.resolve()
 FFMPEG      = SCRIPT_DIR / "bin" / "ffmpeg" / "ffmpeg.exe"
+FFPROBE     = SCRIPT_DIR / "bin" / "ffmpeg" / "ffprobe.exe"
 WHISPER     = SCRIPT_DIR / "bin" / "whisper" / "Release" / "whisper-cli.exe"
 WHISPER_DIR = SCRIPT_DIR / "bin" / "whisper"
 PYTHON      = SCRIPT_DIR / "bin" / "python" / "python.exe"
@@ -137,6 +138,20 @@ def timecode_to_ms(tc: str) -> int:
 def wav_duration_ms(path: Path) -> int:
     with wave.open(str(path), "rb") as wf:
         return int(wf.getnframes() / wf.getframerate() * 1000)
+
+
+def get_media_duration_ms(path: Path) -> int:
+    """Duration of any media file (e.g. the source video) via ffprobe."""
+    if not FFPROBE.exists():
+        raise FileNotFoundError(f"ffprobe not found: {FFPROBE}")
+    result = subprocess.run(
+        [str(FFPROBE), "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(f"ffprobe failed for {path.name}: {result.stderr.strip()}")
+    return int(float(result.stdout.strip()) * 1000)
 
 
 def ms_to_human(ms: int) -> str:
@@ -462,7 +477,12 @@ def step3_separate(work: Path):
     print(f"  OK  {bg_dst.name}  ({bg_dst.stat().st_size // (1024*1024)} MB)")
 
 
-async def _generate_tts_clips(plans: list, clips_dir: Path):
+def speed_to_rate(speed: int) -> str:
+    """Convert a speed adjustment in percent (e.g. 10, -5) to edge-tts's rate string."""
+    return f"{speed:+d}%"
+
+
+async def _generate_tts_clips(plans: list, clips_dir: Path, rate: str = "+0%"):
     """plans: list of dicts with keys: index, text, voice, mp3_name"""
     import edge_tts
     total = len(plans)
@@ -470,13 +490,13 @@ async def _generate_tts_clips(plans: list, clips_dir: Path):
         mp3 = clips_dir / plan["mp3_name"]
         voice_short = plan["voice"].split("-")[2] if plan["voice"].count("-") >= 2 else plan["voice"]
         print(f"  [{i+1:3d}/{total}] [{voice_short}] {plan['text'][:55]}")
-        communicate = edge_tts.Communicate(plan["text"], plan["voice"])
+        communicate = edge_tts.Communicate(plan["text"], plan["voice"], rate=rate)
         await communicate.save(str(mp3))
         size = mp3.stat().st_size // 1024 if mp3.exists() else 0
         print(f"    -> {mp3.name}  ({size} KB)")
 
 
-def step4_tts(work: Path, lang_tts: str, gender: str):
+def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0):
     print("\n[STEP 4/7] Generating TTS clips (one WAV per subtitle)...")
 
     srt_file = work / "step2_translated.srt"
@@ -492,7 +512,9 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
         raise ValueError(f"Unknown TTS language: {lang_tts}. Available: {list(VOICES)}")
     voice_map     = VOICES[lang_key]
     default_voice = voice_map[gender]
+    rate          = speed_to_rate(speed)
     print(f"  Default voice : {default_voice}")
+    print(f"  Speed         : {rate}")
     print(f"  Subtitles     : {len(subs)}")
 
     clips_dir = work / "step4_tts_clips"
@@ -540,7 +562,7 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     print("\n  Generating MP3 clips via edge-tts...")
-    asyncio.run(_generate_tts_clips(plans, clips_dir))
+    asyncio.run(_generate_tts_clips(plans, clips_dir, rate))
 
     # ── Convert MP3 → WAV ─────────────────────────────────────────────────
     print("\n  Converting MP3 -> WAV (24kHz mono)...")
@@ -561,16 +583,25 @@ def step4_tts(work: Path, lang_tts: str, gender: str):
             print(f"  WARN: WAV conversion failed for clip {plan['index']}")
             continue
 
+        actual_dur_ms  = wav_duration_ms(wav)
+        actual_end_ms  = plan["start_ms"] + actual_dur_ms
+        nominal_dur_ms = plan["end_ms"] - plan["start_ms"]
+
         metadata.append({
             "index":    plan["index"],
             "start_ms": plan["start_ms"],
-            "end_ms":   plan["end_ms"],
+            "end_ms":   actual_end_ms,
             "text":     plan["text"],
             "voice":    plan["voice"],
             "mp3":      str(mp3),
             "wav":      str(wav),
         })
-        print(f"    {wav.name}  ({plan['start_ms']/1000:.2f}s -> {plan['end_ms']/1000:.2f}s)  [{plan['voice'].split('-')[2] if plan['voice'].count('-') >= 2 else plan['voice']}]")
+
+        overrun = ""
+        if actual_dur_ms > nominal_dur_ms * 1.15:
+            overrun = f"  (subtitle slot was {nominal_dur_ms/1000:.2f}s)"
+        voice_short = plan["voice"].split("-")[2] if plan["voice"].count("-") >= 2 else plan["voice"]
+        print(f"    {wav.name}  ({plan['start_ms']/1000:.2f}s -> {actual_end_ms/1000:.2f}s)  [{voice_short}]{overrun}")
 
     if not metadata:
         raise RuntimeError("No TTS clips generated. Check edge-tts and internet connection.")
@@ -596,6 +627,17 @@ def step5_merge_tts(work: Path):
     clips = scan_clips(clips_dir)
     if not clips:
         raise ValueError(f"No clip_*.wav files found in {clips_dir}")
+
+    video_duration_ms = None
+    meta = load_work_meta(work)
+    if "video" in meta:
+        video_path = Path(meta["video"])
+        if video_path.exists():
+            try:
+                video_duration_ms = get_media_duration_ms(video_path)
+            except Exception as e:
+                print(f"  WARN: could not read video duration ({e}); "
+                      f"skipping end-of-video check.")
 
     with wave.open(str(clips[0]["file"]), "rb") as wf:
         sample_rate = wf.getframerate()
@@ -642,6 +684,18 @@ def step5_merge_tts(work: Path):
 
         buf[start_f:end_f] += samples
         print(f"  Placed {wav_path.name}: {clip['start_ms']/1000:.2f}s -> {end_f/sample_rate:.2f}s")
+
+    if video_duration_ms is not None:
+        video_frames = int(video_duration_ms / 1000 * sample_rate)
+        if len(buf) > video_frames:
+            overage_ms = int((len(buf) - video_frames) / sample_rate * 1000)
+            print(f"\n  WARNING: merged audio ({ms_to_human(int(len(buf)/sample_rate*1000))}) "
+                  f"runs past the end of the video ({ms_to_human(video_duration_ms)}) "
+                  f"by {ms_to_human(overage_ms)}.")
+            print(f"  Trimming audio to the video's length - the tail of the last line(s) "
+                  f"will be cut. Use the end-of-video check before this step (interactive "
+                  f"mode) to fix it properly instead.")
+            buf = buf[:video_frames]
 
     peak = float(np.max(np.abs(buf)))
     if peak > 32767:
@@ -730,12 +784,12 @@ def step7_assemble(video: Path, work: Path, output_dir: Path) -> Path:
 
 
 def run_steps(video, work, start_step, end_step, output_dir,
-              model, lang_src, lang_tts, gender, bg_vol, tts_vol, orig_vol=0.0):
+              model, lang_src, lang_tts, gender, bg_vol, tts_vol, orig_vol=0.0, speed=0):
     for step in range(start_step, end_step + 1):
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
         elif step == 3: step3_separate(work)
-        elif step == 4: step4_tts(work, lang_tts, gender)
+        elif step == 4: step4_tts(work, lang_tts, gender, speed)
         elif step == 5: step5_merge_tts(work)
         elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol)
         elif step == 7:
@@ -863,8 +917,77 @@ def interactive_overlap_check(clips_dir: Path):
             break
 
 
-def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
-    """Ask TTS language and gender, with optional saved defaults."""
+def interactive_end_check(clips_dir: Path, video_duration_ms: int):
+    """Warn + try to auto-fix when the last TTS clip runs past the end of the video.
+    Mirrors interactive_overlap_check's style, treating the video's end as an
+    immovable boundary (like an unmovable "next clip") that the last clip can't cross."""
+    while True:
+        clips = scan_clips(clips_dir)
+        if not clips:
+            return
+
+        last    = clips[-1]
+        overage = last["end_ms"] - video_duration_ms
+        if overage <= 0:
+            print(f"  OK  Last clip ends at {ms_to_human(last['end_ms'])}, "
+                  f"video is {ms_to_human(video_duration_ms)} - fits.")
+            return
+
+        print(f"\n  {'-'*52}")
+        print(f"  WARNING  Last TTS clip runs past the end of the video!")
+        print(f"    Clip  : {last['file'].name}")
+        print(f"    Ends  : {ms_to_human(last['end_ms'])}")
+        print(f"    Video : {ms_to_human(video_duration_ms)}")
+        print(f"    Over  : {ms_to_human(overage)}")
+
+        # Try auto-fix: pull the clip earlier so it ends exactly at video end,
+        # same feasibility check as propose_resolution's "pull A earlier".
+        new_start = last["start_ms"] - overage
+        prev      = clips[-2] if len(clips) >= 2 else None
+        can_pull  = new_start >= 0 and (prev is None or prev["end_ms"] <= new_start)
+
+        if can_pull:
+            new_name = f"clip_{ms_to_timecode(new_start)}.wav"
+            print(f"\n  Auto-fix:")
+            print(f"    Pull  {last['file'].name}  -{ms_to_human(overage)}")
+            print(f"       ->  {new_name}")
+            choice = input("\n  [A] Apply   [S] Skip (audio will be trimmed at video end): ").strip().lower()
+            if choice == "a":
+                last["file"].rename(last["file"].parent / new_name)
+                print(f"    {last['file'].name}  ->  {new_name}")
+                continue   # re-check in case the pull is still not enough
+            else:
+                print("  Skipped - step 5 will hard-trim the audio to the video's "
+                      "length; the end of this line will be lost.")
+                return
+        else:
+            reason = ("would overlap the previous clip" if prev and prev["end_ms"] > new_start
+                       else "would start before 0:00")
+            print(f"\n  No automatic solution ({reason}).")
+            print("  This line's speech is simply longer than the time left in the video.")
+            print("  Fix manually: shorten the translated text for this line, or trim/extend the video.")
+            print("  Otherwise step 5 will hard-trim the audio to the video's length,")
+            print("  cutting off the end of this line.")
+            return
+
+
+def session_label(work_dir: Path) -> str:
+    """One-line name plus a second line of saved settings, for the resume picker -
+    lets you check a previous video's voice/speed/volumes without opening its JSON."""
+    meta  = load_work_meta(work_dir)
+    parts = []
+    if "lang_tts" in meta:
+        parts.append(f"{meta['lang_tts']}/{meta.get('gender', '?')} "
+                      f"{speed_to_rate(meta.get('speed', 0))}")
+    if "bg_vol" in meta:
+        parts.append(f"bg{meta['bg_vol']}/tts{meta.get('tts_vol')}/orig{meta.get('orig_vol', 0.0)}")
+    if not parts:
+        return work_dir.name
+    return f"{work_dir.name}\n        " + "  ".join(parts)
+
+
+def prompt_tts_options(default_lang=None, default_gender=None, default_speed=0) -> tuple:
+    """Ask TTS language, gender, and speaking rate, with optional saved defaults."""
     tts_langs = [
         ("French Canada  - fr-CA", "fr-CA"),
         ("French France  - fr-FR", "fr-FR"),
@@ -896,7 +1019,19 @@ def prompt_tts_options(default_lang=None, default_gender=None) -> tuple:
     print(f"    [HOMME]  / [MAN]      : {voice_map['male']}")
     print(f"    [NARRATEUR]/[NARRATOR]: {voice_map['narrator']}")
 
-    return lang_tts, gender
+    default_speed = default_speed if default_speed is not None else 0
+    raw = input(f"\n  Speaking rate, e.g. +10 for 10% faster, -5 for 5% slower "
+                f"[{default_speed:+d}]: ").strip()
+    try:
+        speed = int(raw) if raw else default_speed
+    except ValueError:
+        print("  Not a whole number, using default.")
+        speed = default_speed
+    if speed:
+        print(f"  Rate: {speed_to_rate(speed)}  (saved for this video; "
+              f"re-enter the same value on other videos to keep this actor's pace consistent)")
+
+    return lang_tts, gender, speed
 
 
 def prompt_volumes(bg_default: float = 0.7, tts_default: float = 1.3, orig_default: float = 0.0) -> tuple:
@@ -945,7 +1080,7 @@ def interactive_mode():
         )[:15] if temp_base.exists() else []
 
         if sessions:
-            labels = [s.name for s in sessions] + ["Type the path manually"]
+            labels = [session_label(s) for s in sessions] + ["Type the path manually"]
             idx = pick("Which session?", labels, default=0)
             work = sessions[idx] if idx < len(sessions) else ask_path("Path to work directory:")
         else:
@@ -1057,15 +1192,17 @@ def interactive_mode():
 
     # ── Settings for remaining steps — all asked upfront ──────────────────
     lang_tts = bg_vol = tts_vol = orig_vol = gender = None
+    speed = 0
 
     if start_step <= 4 <= end_step:
         print(f"\n{'-'*60}")
         print("  TTS voice settings (step 4):")
-        lang_tts, gender = prompt_tts_options(
+        lang_tts, gender, speed = prompt_tts_options(
             default_lang=meta.get("lang_tts"),
             default_gender=meta.get("gender"),
+            default_speed=meta.get("speed", 0),
         )
-        save_work_meta(work, {"lang_tts": lang_tts, "gender": gender})
+        save_work_meta(work, {"lang_tts": lang_tts, "gender": gender, "speed": speed})
         print(f"{'-'*60}")
 
     if start_step <= 6 <= end_step:
@@ -1089,7 +1226,8 @@ def interactive_mode():
     if start_step <= 2 <= end_step:
         print(f"  Model    : {model}  |  lang-src: {lang_src}")
     if lang_tts:
-        print(f"  Voice    : {lang_tts} / {gender}")
+        speed_str = f"  speed={speed_to_rate(speed)}" if speed else ""
+        print(f"  Voice    : {lang_tts} / {gender}{speed_str}")
     if bg_vol is not None:
         orig_str = f"  orig={orig_vol}" if orig_vol else ""
         print(f"  Volumes  : bg={bg_vol}  tts={tts_vol}{orig_str}")
@@ -1108,12 +1246,24 @@ def interactive_mode():
             print(f"\n{'-'*60}")
             print("  Checking for overlapping clips before merge...")
             interactive_overlap_check(work / "step4_tts_clips")
+
+            print("\n  Checking that TTS doesn't run past the end of the video...")
+            vmeta     = load_work_meta(work)
+            vid_check = video or (Path(vmeta["video"]) if "video" in vmeta else None)
+            if vid_check and vid_check.exists():
+                try:
+                    vdur = get_media_duration_ms(vid_check)
+                    interactive_end_check(work / "step4_tts_clips", vdur)
+                except Exception as e:
+                    print(f"  WARN: could not check video duration ({e})")
+            else:
+                print("  WARN: original video not found - skipping this check.")
             print(f"{'-'*60}")
 
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
         elif step == 3: step3_separate(work)
-        elif step == 4: step4_tts(work, lang_tts, gender)
+        elif step == 4: step4_tts(work, lang_tts, gender, speed)
         elif step == 5: step5_merge_tts(work)
         elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol or 0.0)
         elif step == 7:
@@ -1166,6 +1316,8 @@ def cli_mode():
     parser.add_argument("--tts-vol",   type=float, default=1.3)
     parser.add_argument("--orig-vol",  type=float, default=0.0,
                         help="Volume for original vocals in background (default: 0 = off)")
+    parser.add_argument("--speed",     type=int, default=0,
+                        help="TTS speaking rate adjustment in percent, e.g. 10 for +10%% faster (default: 0)")
     args = parser.parse_args()
 
     start_step = args.only_step or args.from_step
@@ -1199,7 +1351,7 @@ def cli_mode():
     if video:
         print(f"  Video    : {video}")
     print(f"  Work dir : {work}")
-    print(f"  TTS      : {args.lang_tts} / {args.gender}")
+    print(f"  TTS      : {args.lang_tts} / {args.gender}  speed={speed_to_rate(args.speed)}")
     print(f"  Model    : {args.model}  |  lang-src: {args.lang_src}")
     orig_str = f"  orig={args.orig_vol}" if args.orig_vol else ""
     print(f"  Volumes  : bg={args.bg_vol}  tts={args.tts_vol}{orig_str}")
@@ -1213,7 +1365,7 @@ def cli_mode():
         model=args.model, lang_src=args.lang_src,
         lang_tts=args.lang_tts, gender=args.gender,
         bg_vol=args.bg_vol, tts_vol=args.tts_vol,
-        orig_vol=args.orig_vol,
+        orig_vol=args.orig_vol, speed=args.speed,
     )
 
 
