@@ -27,6 +27,7 @@ Debug usage (no interactive prompts):
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -55,6 +56,9 @@ WHISPER_DIR = SCRIPT_DIR / "bin" / "whisper"
 PYTHON      = SCRIPT_DIR / "bin" / "python" / "python.exe"
 
 # ─── TTS voice map ────────────────────────────────────────────────────────────
+# Used only as the DEFAULT voice for untagged subtitle lines. Voices for
+# [BRACKETED] speaker tags are discovered from the SRT and assigned
+# interactively at the start of step 4 - see prompt_tag_voice_map() below.
 
 VOICES = {
     "fr-CA": {"female": "fr-CA-SylvieNeural",     "male": "fr-CA-ThierryNeural",  "narrator": "fr-CA-AntoineNeural"},
@@ -73,17 +77,7 @@ VOICES = {
 
 # ─── Subtitle text helpers ───────────────────────────────────────────────────
 
-# [MAN] / [HOMME] → force male voice for that line
-# [WOMAN] / [FEMME] → force female voice for that line
-# Any other [bracketed content] is stripped and NOT voiced
-VOICE_DIRECTIVES = {
-    "[man]":       "male",
-    "[homme]":     "male",
-    "[woman]":     "female",
-    "[femme]":     "female",
-    "[narrator]":  "narrator",
-    "[narrateur]": "narrator",
-}
+TAG_RE = re.compile(r'\[([^\[\]]+)\]')
 
 
 def ms_to_timecode(ms: int) -> str:
@@ -94,34 +88,80 @@ def ms_to_timecode(ms: int) -> str:
     return f"{h:02d}h{m:02d}m{s:02d}s{ms:03d}"
 
 
-def parse_subtitle(text: str, voice_map: dict) -> tuple:
+# Some words are mispronounced by French TTS voices because they follow a
+# regular French spelling rule that doesn't apply to them - e.g. "Inuit" gets
+# the silent final "-t" of "nuit"/"cuit"/"bruit" instead of being pronounced
+# (edge-tts escapes the text into SSML, so <phoneme> overrides don't work -
+# see mkssml() in edge_tts/communicate.py). Overrides are loaded from
+# pronunciation_fixes.csv (one word per line: mot,remplacement) next to this
+# script, so they can be edited without touching code. Applied to the TTS
+# audio only - the saved SRT text is never touched.
+PRONUNCIATION_CSV = SCRIPT_DIR / "pronunciation_fixes.csv"
+
+
+def load_pronunciation_fixes() -> dict:
+    """Read pronunciation_fixes.csv -> {word_lowercase: replacement}.
+    Missing file or header-only file -> no fixes (returns {})."""
+    if not PRONUNCIATION_CSV.exists():
+        return {}
+    import csv
+    with open(PRONUNCIATION_CSV, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if rows and [c.strip().lower() for c in rows[0][:2]] == ["mot", "remplacement"]:
+        rows = rows[1:]
+    fixes = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        word, replacement = row[0].strip(), row[1].strip()
+        if word and replacement:
+            fixes[word.lower()] = replacement
+    return fixes
+
+
+def apply_pronunciation_fixes(text: str, fixes: dict) -> str:
+    if not fixes:
+        return text
+    pattern = re.compile(
+        "|".join(rf"\b{re.escape(w)}\b" for w in fixes), re.IGNORECASE
+    )
+    def _sub(m):
+        word  = m.group(0)
+        fixed = fixes[word.lower()]
+        if word.isupper():
+            return fixed.upper()
+        if word[0].isupper():
+            return fixed[0].upper() + fixed[1:]
+        return fixed
+    return pattern.sub(_sub, text)
+
+
+def parse_subtitle(text: str, tag_voice_map: dict, default_voice: str) -> tuple:
     """
     Returns (clean_text, voice) or (None, None) to skip this subtitle.
 
-    Rules:
-    - [MAN] / [HOMME]           → use male voice, strip the tag
-    - [WOMAN] / [FEMME]         → use female voice, strip the tag
-    - [NARRATOR] / [NARRATEUR]  → use narrator voice, strip the tag
-    - Any other [bracketed content] → stripped silently
-    - If nothing is left after stripping, return (None, None)
+    Every [BRACKETED] tag is stripped from the text. If tag_voice_map has a
+    voice assigned for it (see prompt_tag_voice_map), that voice is used for
+    this line instead of default_voice. A tag mapped to None (user chose
+    "leave unvoiced") is stripped like any other and falls back to
+    default_voice. If nothing is left after stripping, return (None, None).
     """
-    voice_override = None
-    lower = text.lower()
+    voice = default_voice
 
-    for tag, gender in VOICE_DIRECTIVES.items():
-        if tag in lower:
-            voice_override = voice_map[gender]
-            text = re.sub(re.escape(tag), "", text, flags=re.IGNORECASE)
+    def _strip(m):
+        nonlocal voice
+        assigned = tag_voice_map.get(f"[{m.group(1).strip().lower()}]")
+        if assigned:
+            voice = assigned
+        return ""
 
-    # Strip ALL remaining [bracketed content] (e.g. [MUSIQUE], [inaudible])
-    text = re.sub(r'\[.*?\]', '', text)
-    # Collapse extra whitespace left by stripping
+    text = TAG_RE.sub(_strip, text)
     text = re.sub(r'\s+', ' ', text).strip()
 
     if not text:
         return None, None
 
-    return text, voice_override   # None voice_override → caller uses its default
+    return text, voice
 
 
 # ─── Timecode ↔ ms (used by overlap checker and step 5) ──────────────────────
@@ -490,13 +530,128 @@ async def _generate_tts_clips(plans: list, clips_dir: Path, rate: str = "+0%"):
         mp3 = clips_dir / plan["mp3_name"]
         voice_short = plan["voice"].split("-")[2] if plan["voice"].count("-") >= 2 else plan["voice"]
         print(f"  [{i+1:3d}/{total}] [{voice_short}] {plan['text'][:55]}")
-        communicate = edge_tts.Communicate(plan["text"], plan["voice"], rate=rate)
-        await communicate.save(str(mp3))
+
+        # edge-tts is an unofficial API that can occasionally stall on a
+        # single request after many in a row, hanging the whole batch with
+        # no error. Cap each attempt, retry with backoff instead of blocking
+        # forever, and pace requests to make the stall less likely to begin
+        # with.
+        for attempt in range(1, 4):
+            try:
+                communicate = edge_tts.Communicate(plan["text"], plan["voice"], rate=rate)
+                await asyncio.wait_for(communicate.save(str(mp3)), timeout=45)
+                break
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(
+                        f"TTS failed for clip {i+1}/{total} ({plan['mp3_name']}) "
+                        f"after 3 attempts: {e}"
+                    ) from e
+                wait = 3 * attempt
+                print(f"    WARN: attempt {attempt} failed ({e}) - retrying in {wait}s...")
+                await asyncio.sleep(wait)
+
         size = mp3.stat().st_size // 1024 if mp3.exists() else 0
         print(f"    -> {mp3.name}  ({size} KB)")
+        await asyncio.sleep(0.3)
 
 
-def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0):
+def discover_srt_tags(srt_path: Path) -> list:
+    """Scan an SRT's cue text for every distinct [BRACKETED] tag, in
+    first-seen order, e.g. ['HOMME', 'HOMME1', 'NARRATEUR']."""
+    seen = {}
+    for sub in parse_srt(srt_path):
+        for m in TAG_RE.finditer(sub["text"]):
+            key = m.group(1).strip()
+            if key.lower() not in seen:
+                seen[key.lower()] = key
+    return list(seen.values())
+
+
+async def _list_edge_voices():
+    import edge_tts
+    return await edge_tts.list_voices()
+
+
+def fetch_voices_for_lang(lang_tts: str) -> list:
+    """All edge-tts voices sharing lang_tts's base language, e.g. lang_tts=
+    'fr-CA' matches every fr-* voice (fr-CA, fr-FR, fr-BE, fr-CH...) so
+    interlocutors can be spread across the full pool, not just one locale."""
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    all_voices = asyncio.run(_list_edge_voices())
+    prefix = lang_tts.split("-")[0].lower()
+    matched = [v for v in all_voices if v["Locale"].lower().startswith(prefix)]
+    matched.sort(key=lambda v: (v["Locale"], v["Gender"], v["ShortName"]))
+    return matched
+
+
+def prompt_tag_voice_map(work: Path, srt_path: Path, lang_tts: str) -> dict:
+    """Ask which voice to use for each distinct [TAG] found in the SRT.
+    Returns {'[tag]': shortname_or_None} - None means "leave unvoiced"
+    (tag stripped, line falls back to the default voice). Cached in
+    work_meta.json so resuming a session can reuse previous assignments."""
+    tags = discover_srt_tags(srt_path)
+    if not tags:
+        return {}
+
+    meta   = load_work_meta(work)
+    cached = meta.get("tag_voices", {})
+
+    print(f"\n{'-'*60}")
+    print(f"  {len(tags)} speaker tag(s) found in the subtitles: "
+          + ", ".join(f"[{t}]" for t in tags))
+
+    if cached and all(f"[{t.lower()}]" in cached for t in tags):
+        print("  Previously assigned voices:")
+        for t in tags:
+            print(f"    [{t}] -> {cached[f'[{t.lower()}]'] or '(default voice)'}")
+        choice = input("\n  Reuse these assignments? [Y/n]: ").strip().lower()
+        if choice != "n":
+            print(f"{'-'*60}")
+            return cached
+
+    print("  Fetching available voices from edge-tts...")
+    voices = fetch_voices_for_lang(lang_tts)
+    if not voices:
+        print(f"  WARN: no edge-tts voices found for '{lang_tts}' - "
+              f"tags will be stripped and use the default voice.")
+        return {f"[{t.lower()}]": None for t in tags}
+
+    options = [f"{v['ShortName']:32s} {v['Gender']:6s} {v['LocaleName']}" for v in voices]
+    options.append("Type a custom edge-tts voice ID")
+    options.append("Leave unvoiced (strip tag, use the default voice)")
+
+    result = {}
+    for t in tags:
+        default_idx = len(options) - 1   # default: leave unvoiced
+        prev = cached.get(f"[{t.lower()}]")
+        if prev:
+            for i, v in enumerate(voices):
+                if v["ShortName"] == prev:
+                    default_idx = i
+                    break
+        idx = pick(f"Voice for [{t}]:", options, default=default_idx)
+        if idx < len(voices):
+            result[f"[{t.lower()}]"] = voices[idx]["ShortName"]
+        elif idx == len(voices):
+            raw = input("    edge-tts voice ID (e.g. fr-CA-AntoineNeural): ").strip()
+            result[f"[{t.lower()}]"] = raw or None
+        else:
+            result[f"[{t.lower()}]"] = None
+
+    save_work_meta(work, {"tag_voices": result})
+    print(f"{'-'*60}")
+    return result
+
+
+def _clip_hash(text: str, voice: str, rate: str) -> str:
+    """Fingerprint of everything that changes a clip's audio content."""
+    raw = f"{text}\x1f{voice}\x1f{rate}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0, regen: str = "fast"):
     print("\n[STEP 4/7] Generating TTS clips (one WAV per subtitle)...")
 
     srt_file = work / "step2_translated.srt"
@@ -516,32 +671,34 @@ def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0):
     print(f"  Default voice : {default_voice}")
     print(f"  Speed         : {rate}")
     print(f"  Subtitles     : {len(subs)}")
+    print(f"  Regen mode    : {regen}")
+
+    tag_voice_map = prompt_tag_voice_map(work, srt_file, lang_tts)
+
+    pron_fixes = load_pronunciation_fixes()
+    if pron_fixes:
+        print(f"  Pronunciation fixes : {len(pron_fixes)} word(s) "
+              f"from {PRONUNCIATION_CSV.name}")
 
     clips_dir = work / "step4_tts_clips"
     clips_dir.mkdir(exist_ok=True)
-
-    # Remove stale clips from any previous run so deleted/merged subtitles
-    # don't linger and get picked up by step 5.
-    stale = list(clips_dir.glob("clip_*.mp3")) + list(clips_dir.glob("clip_*.wav"))
-    if stale:
-        print(f"  Removing {len(stale)} stale clip(s) from previous run...")
-        for f in stale:
-            f.unlink()
+    manifest_file = work / "step4_tts_manifest.json"
 
     # ── Plan all clips (filter + resolve per-line voice) ──────────────────
     plans   = []
     skipped = []
     for sub in subs:
-        clean_text, voice_override = parse_subtitle(sub["text"], voice_map)
+        clean_text, voice = parse_subtitle(sub["text"], tag_voice_map, default_voice)
 
         if clean_text is None:
             print(f"  SKIP [{sub['index']:3d}] (bracketed/empty): {sub['text']}")
             skipped.append(sub["index"])
             continue
 
+        clean_text = apply_pronunciation_fixes(clean_text, pron_fixes)
+
         tc   = ms_to_timecode(sub["start_ms"])
         name = f"clip_{tc}"            # e.g. clip_00h01m23s456
-        voice = voice_override or default_voice
 
         plans.append({
             "index":    sub["index"],
@@ -551,20 +708,62 @@ def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0):
             "voice":    voice,
             "mp3_name": f"{name}.mp3",
             "wav_name": f"{name}.wav",
+            "hash":     _clip_hash(clean_text, voice, rate),
         })
 
-    print(f"\n  {len(plans)} clips to generate, {len(skipped)} skipped")
     if not plans:
         raise RuntimeError("No clips to generate after filtering.")
 
-    # ── Generate MP3s ──────────────────────────────────────────────────────
-    if sys.platform == "win32":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # ── Decide which clips actually need a fresh edge-tts call ─────────────
+    # "complete": today's behaviour - wipe every clip, regenerate everything.
+    # "fast": keep clips whose (text, voice, rate) hash is unchanged from the
+    # last run - only new/edited/re-voiced lines hit the network. Clips left
+    # over from a removed/moved line (no current plan matches its filename)
+    # are deleted either way, so step 5 never picks up a stale one.
+    stem_to_plan = {p["mp3_name"][:-4]: p for p in plans}
+    existing = list(clips_dir.glob("clip_*.mp3")) + list(clips_dir.glob("clip_*.wav"))
+    orphans  = [f for f in existing if f.stem not in stem_to_plan]
 
-    print("\n  Generating MP3 clips via edge-tts...")
-    asyncio.run(_generate_tts_clips(plans, clips_dir, rate))
+    if regen == "complete":
+        to_generate = plans
+        if existing:
+            print(f"  Mode COMPLETE - removing all {len(existing)} existing clip file(s)...")
+            for f in existing:
+                f.unlink()
+    else:
+        if orphans:
+            print(f"  Removing {len(orphans)} orphaned clip(s) (line removed/moved)...")
+            for f in orphans:
+                f.unlink()
 
-    # ── Convert MP3 → WAV ─────────────────────────────────────────────────
+        manifest = {}
+        if manifest_file.exists():
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+
+        to_generate = []
+        for p in plans:
+            stem = p["mp3_name"][:-4]
+            mp3  = clips_dir / p["mp3_name"]
+            if manifest.get(stem) == p["hash"] and mp3.exists():
+                continue   # unchanged - reuse the existing mp3/wav as-is
+            to_generate.append(p)
+
+        print(f"  Mode FAST - {len(plans) - len(to_generate)} clip(s) unchanged (reused), "
+              f"{len(to_generate)} to (re)generate")
+
+    print(f"\n  {len(plans)} total lines, {len(skipped)} skipped, "
+          f"{len(to_generate)} to synthesize")
+
+    # ── Generate MP3s (network - only for what actually changed) ───────────
+    if to_generate:
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        print("\n  Generating MP3 clips via edge-tts...")
+        asyncio.run(_generate_tts_clips(to_generate, clips_dir, rate))
+    else:
+        print("\n  Nothing to synthesize - all clips reused from the previous run.")
+
+    # ── Convert MP3 → WAV for every current line (cheap/local either way) ──
     print("\n  Converting MP3 -> WAV (24kHz mono)...")
     metadata = []
     for plan in plans:
@@ -608,6 +807,10 @@ def step4_tts(work: Path, lang_tts: str, gender: str, speed: int = 0):
 
     meta_file = work / "step4_tts_metadata.json"
     meta_file.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    new_manifest = {p["mp3_name"][:-4]: p["hash"] for p in plans}
+    manifest_file.write_text(json.dumps(new_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
     print(f"\n  {len(metadata)}/{len(subs)} clips ready in {clips_dir.name}/")
     if skipped:
         print(f"  Skipped subtitle indices: {skipped}")
@@ -784,12 +987,12 @@ def step7_assemble(video: Path, work: Path, output_dir: Path) -> Path:
 
 
 def run_steps(video, work, start_step, end_step, output_dir,
-              model, lang_src, lang_tts, gender, bg_vol, tts_vol, orig_vol=0.0, speed=0):
+              model, lang_src, lang_tts, gender, bg_vol, tts_vol, orig_vol=0.0, speed=0, regen="fast"):
     for step in range(start_step, end_step + 1):
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
         elif step == 3: step3_separate(work)
-        elif step == 4: step4_tts(work, lang_tts, gender, speed)
+        elif step == 4: step4_tts(work, lang_tts, gender, speed, regen)
         elif step == 5: step5_merge_tts(work)
         elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol)
         elif step == 7:
@@ -886,8 +1089,8 @@ def interactive_overlap_check(clips_dir: Path):
                     for line in label.split("\n"):
                         print(f"    {line}")
                 print()
-                choice = input("  [A] Apply   [S] Skip (fix manually): ").strip().lower()
-                if choice == "a":
+                choice = input("  [A] Apply (default)   [S] Skip (fix manually): ").strip().lower()
+                if choice != "s":
                     for old, new, _ in resolution:
                         old.rename(new)
                         print(f"    {old.name}  ->  {new.name}")
@@ -908,13 +1111,18 @@ def interactive_overlap_check(clips_dir: Path):
             print("  Re-scanning...")
             continue
 
-        # All clusters shown, no pending auto-apply
+        # All clusters shown, no pending auto-apply. Unlike the auto-fix
+        # prompts above, this one lets audio actually overlap/garble if
+        # skipped - require an explicit key instead of accepting Enter.
         print(f"  Folder: {clips_dir}")
-        choice = input("  [R] Re-scan   [Enter] Continue anyway: ").strip().lower()
-        if choice != "r":
-            if clusters:
-                print("  Continuing with remaining overlaps - they will mix together.")
-            break
+        choice = None
+        while choice not in ("r", "s"):
+            choice = input("  [R] Re-scan   [S] Skip and continue anyway: ").strip().lower()
+        if choice == "r":
+            continue
+        if clusters:
+            print("  Continuing with remaining overlaps - they will mix together.")
+        break
 
 
 def interactive_end_check(clips_dir: Path, video_duration_ms: int):
@@ -951,8 +1159,8 @@ def interactive_end_check(clips_dir: Path, video_duration_ms: int):
             print(f"\n  Auto-fix:")
             print(f"    Pull  {last['file'].name}  -{ms_to_human(overage)}")
             print(f"       ->  {new_name}")
-            choice = input("\n  [A] Apply   [S] Skip (audio will be trimmed at video end): ").strip().lower()
-            if choice == "a":
+            choice = input("\n  [A] Apply (default)   [S] Skip (audio will be trimmed at video end): ").strip().lower()
+            if choice != "s":
                 last["file"].rename(last["file"].parent / new_name)
                 print(f"    {last['file'].name}  ->  {new_name}")
                 continue   # re-check in case the pull is still not enough
@@ -1191,7 +1399,7 @@ def interactive_mode():
         save_work_meta(work, {"video": str(video), "lang_src": lang_src, "model": model})
 
     # ── Settings for remaining steps — all asked upfront ──────────────────
-    lang_tts = bg_vol = tts_vol = orig_vol = gender = None
+    lang_tts = bg_vol = tts_vol = orig_vol = gender = regen = None
     speed = 0
 
     if start_step <= 4 <= end_step:
@@ -1203,6 +1411,15 @@ def interactive_mode():
             default_speed=meta.get("speed", 0),
         )
         save_work_meta(work, {"lang_tts": lang_tts, "gender": gender, "speed": speed})
+
+        regen_options = [
+            "Fast - only regenerate new/changed/re-voiced lines  (recommended)",
+            "Complete - wipe and regenerate every clip from scratch",
+        ]
+        default_regen_idx = 1 if meta.get("regen") == "complete" else 0
+        idx = pick("Clip regeneration:", regen_options, default=default_regen_idx)
+        regen = "complete" if idx == 1 else "fast"
+        save_work_meta(work, {"regen": regen})
         print(f"{'-'*60}")
 
     if start_step <= 6 <= end_step:
@@ -1228,6 +1445,7 @@ def interactive_mode():
     if lang_tts:
         speed_str = f"  speed={speed_to_rate(speed)}" if speed else ""
         print(f"  Voice    : {lang_tts} / {gender}{speed_str}")
+        print(f"  Regen    : {regen}")
     if bg_vol is not None:
         orig_str = f"  orig={orig_vol}" if orig_vol else ""
         print(f"  Volumes  : bg={bg_vol}  tts={tts_vol}{orig_str}")
@@ -1263,7 +1481,7 @@ def interactive_mode():
         if   step == 1: step1_extract(video, work)
         elif step == 2: step2_transcribe(work, model, lang_src)
         elif step == 3: step3_separate(work)
-        elif step == 4: step4_tts(work, lang_tts, gender, speed)
+        elif step == 4: step4_tts(work, lang_tts, gender, speed, regen)
         elif step == 5: step5_merge_tts(work)
         elif step == 6: step6_mix(work, bg_vol, tts_vol, orig_vol or 0.0)
         elif step == 7:
@@ -1318,6 +1536,10 @@ def cli_mode():
                         help="Volume for original vocals in background (default: 0 = off)")
     parser.add_argument("--speed",     type=int, default=0,
                         help="TTS speaking rate adjustment in percent, e.g. 10 for +10%% faster (default: 0)")
+    parser.add_argument("--regen",     choices=["fast", "complete"], default="fast",
+                        help="Step 4 clip regeneration: 'fast' only (re)synthesizes "
+                             "new/changed/re-voiced lines (default); 'complete' wipes "
+                             "and regenerates every clip")
     args = parser.parse_args()
 
     start_step = args.only_step or args.from_step
@@ -1330,6 +1552,8 @@ def cli_mode():
     if not FFMPEG.exists():
         parser.error(f"FFmpeg not found: {FFMPEG}\nRun INSTALLER.bat first.")
 
+    video = Path(args.video).resolve() if args.video else None
+
     if args.work_dir:
         work = Path(args.work_dir).resolve()
         if not work.exists():
@@ -1339,8 +1563,6 @@ def cli_mode():
         stem = sanitize_name(video.stem) if video else "video"
         work = SCRIPT_DIR / "TEMP" / f"{stem}_{ts}"
         work.mkdir(parents=True, exist_ok=True)
-
-    video = Path(args.video).resolve() if args.video else None
 
     output_dir = SCRIPT_DIR / "output"
     output_dir.mkdir(exist_ok=True)
@@ -1355,6 +1577,7 @@ def cli_mode():
     print(f"  Model    : {args.model}  |  lang-src: {args.lang_src}")
     orig_str = f"  orig={args.orig_vol}" if args.orig_vol else ""
     print(f"  Volumes  : bg={args.bg_vol}  tts={args.tts_vol}{orig_str}")
+    print(f"  Regen    : {args.regen}")
     print(f"  Steps    : {start_step} -> {end_step}")
     print()
 
@@ -1366,6 +1589,7 @@ def cli_mode():
         lang_tts=args.lang_tts, gender=args.gender,
         bg_vol=args.bg_vol, tts_vol=args.tts_vol,
         orig_vol=args.orig_vol, speed=args.speed,
+        regen=args.regen,
     )
 
 
