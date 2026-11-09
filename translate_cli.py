@@ -29,12 +29,13 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import wave
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Windows picks the console's active codepage (often cp1252) for stdout/stderr
@@ -980,8 +981,10 @@ def step7_assemble(video: Path, work: Path, output_dir: Path) -> Path:
          "-map", "0:v",
          "-map", "1:a",
          "-c:a", "aac", "-b:a", "192k",
+         "-metadata", "creation_time=" + datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000000Z"),
          out],
         label="ffmpeg assemble")
+    os.utime(out, None)  # bump file "Date modified" to now
     print(f"  OK  {out}")
     return out
 

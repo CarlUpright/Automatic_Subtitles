@@ -17,3 +17,8 @@ output/
 *.mp4
 *.mkv
 *.srt
+
+# Python / logs
+__pycache__/
+*.pyc
+run_log.txt
